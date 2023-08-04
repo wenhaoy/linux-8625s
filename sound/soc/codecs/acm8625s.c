@@ -23,9 +23,9 @@
 #include <sound/pcm.h>
 #include <sound/initval.h>
 
-/* Datasheet-defined registers on page 0, book 0 */
+/* Datasheet-defined registers on page 0 */
 #define REG_PAGE		0x00
-#define REG_DEVICE_STATE	0x04   // wenhaoy: REG_DEVICE_STATE
+#define REG_DEVICE_STATE	0x04
 #define REG_STATE_REPORT	0x16
 #define REG_GLOBAL_FAULT1	0x17
 #define REG_GLOBAL_FAULT2	0x18
@@ -150,7 +150,6 @@ struct acm8625s_priv {
 	bool				is_powered;
 	bool				is_muted;
 
-	struct work_struct		work;
 	struct mutex			lock;
 };
 
@@ -173,26 +172,19 @@ static void acm8625s_refresh(struct acm8625s_priv *acm8625s)
 	struct regmap *rm = acm8625s->regmap;
 
 	dev_emerg(&acm8625s->i2c->dev, "refresh: is_muted=%d, vol=%d/%d\n",
-		acm8625s->is_muted, acm8625s->vol[0], acm8625s->vol[1]);
+		  acm8625s->is_muted, acm8625s->vol[0], acm8625s->vol[1]);
 
-	// regmap_write(rm, REG_PAGE, 0x00);
-	// regmap_write(rm, REG_BOOK, 0x8c);
 	regmap_write(rm, REG_PAGE, 0x04);
 
-	/* Refresh volume. The actual volume control documented in the
-	 * datasheet doesn't seem to work correctly. This is a pair of
-	 * DSP registers which are *not* documented in the datasheet.
-	 */
 	set_dsp_scale(rm, 0x7c, acm8625s->vol[0]);
 	set_dsp_scale(rm, 0x80, acm8625s->vol[1]);
 
 	regmap_write(rm, REG_PAGE, 0x00);
-	// regmap_write(rm, REG_BOOK, 0x00);
 
 	/* Set/clear digital soft-mute */
 	regmap_write(rm, REG_DEVICE_STATE,
-		(acm8625s->is_muted ? DEVICE_STATE_MUTE : 0) |
-		DEVICE_STATE_PLAY);
+		     (acm8625s->is_muted ? DEVICE_STATE_MUTE : 0) |
+			     DEVICE_STATE_PLAY);
 }
 
 static int acm8625s_vol_info(struct snd_kcontrol *kcontrol,
@@ -246,8 +238,8 @@ static int acm8625s_vol_put(struct snd_kcontrol *kcontrol,
 		acm8625s->vol[0] = ucontrol->value.integer.value[0];
 		acm8625s->vol[1] = ucontrol->value.integer.value[1];
 		dev_emerg(component->dev, "set vol=%d/%d (is_powered=%d)\n",
-			acm8625s->vol[0], acm8625s->vol[1],
-			acm8625s->is_powered);
+			  acm8625s->vol[0], acm8625s->vol[1],
+			  acm8625s->is_powered);
 		if (acm8625s->is_powered)
 			acm8625s_refresh(acm8625s);
 		ret = 1;
@@ -278,118 +270,9 @@ static void send_cfg(struct regmap *rm,
 		regmap_write(rm, s[i], s[i + 1]);
 }
 
-/* The TAS5805M DSP can't be configured until the I2S clock has been
- * present and stable for 5ms, or else it won't boot and we get no
- * sound.
- */
-static int acm8625s_trigger(struct snd_pcm_substream *substream, int cmd,
-			    struct snd_soc_dai *dai)
-{
-	struct snd_soc_component *component = dai->component;
-	struct acm8625s_priv *acm8625s =
-		snd_soc_component_get_drvdata(component);
-
-	switch (cmd) {
-	case SNDRV_PCM_TRIGGER_START:
-	case SNDRV_PCM_TRIGGER_RESUME:
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		dev_emerg(component->dev, "clock start\n");
-		schedule_work(&acm8625s->work);
-		break;
-
-	case SNDRV_PCM_TRIGGER_STOP:
-	case SNDRV_PCM_TRIGGER_SUSPEND:
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		break;
-
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static void do_work(struct work_struct *work)
-{
-	struct acm8625s_priv *acm8625s =
-	       container_of(work, struct acm8625s_priv, work);
-	struct regmap *rm = acm8625s->regmap;
-
-	dev_emerg(&acm8625s->i2c->dev, "DSP startup\n");
-
-	mutex_lock(&acm8625s->lock);
-	/* We mustn't issue any I2C transactions until the I2S
-	 * clock is stable. Furthermore, we must allow a 5ms
-	 * delay after the first set of register writes to
-	 * allow the DSP to boot before configuring it.
-	 */
-	usleep_range(5000, 10000);
-	send_cfg(rm, dsp_cfg_preboot, ARRAY_SIZE(dsp_cfg_preboot));
-	usleep_range(5000, 15000);
-	// wenhaoy: temporarily disable dsp setting
-	// send_cfg(rm, acm8625s->dsp_cfg_data, acm8625s->dsp_cfg_len);
-
-	acm8625s->is_powered = true;
-	acm8625s_refresh(acm8625s);
-	mutex_unlock(&acm8625s->lock);
-}
-
-static int acm8625s_dac_event(struct snd_soc_dapm_widget *w,
-			      struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
-	struct acm8625s_priv *acm8625s =
-		snd_soc_component_get_drvdata(component);
-	struct regmap *rm = acm8625s->regmap;
-
-	if (event & SND_SOC_DAPM_PRE_PMD) {
-		unsigned int channel_state, global1, global2, global3;
-
-		dev_emerg(component->dev, "DSP shutdown\n");
-		cancel_work_sync(&acm8625s->work);
-
-		mutex_lock(&acm8625s->lock);
-		if (acm8625s->is_powered) {
-			acm8625s->is_powered = false;
-
-			regmap_write(rm, REG_PAGE, 0x00);
-
-			regmap_read(rm, REG_STATE_REPORT, &channel_state);
-			regmap_read(rm, REG_GLOBAL_FAULT1, &global1);
-			regmap_read(rm, REG_GLOBAL_FAULT2, &global2);
-			regmap_read(rm, REG_GLOBAL_FAULT3, &global3);
-
-			dev_emerg(component->dev, "fault regs: CHANNEL=%02x, "
-				"GLOBAL1=%02x, GLOBAL2=%02x, GLOBAL3=%02x\n",
-				channel_state, global1, global2, global3);
-
-			regmap_write(rm, REG_DEVICE_STATE, DEVICE_STATE_HIZ);
-		}
-		mutex_unlock(&acm8625s->lock);
-	}
-
-	return 0;
-}
-
-static const struct snd_soc_dapm_route acm8625s_audio_map[] = {
-	{ "DAC", NULL, "DAC IN" },
-	{ "OUT", NULL, "DAC" },
-};
-
-static const struct snd_soc_dapm_widget acm8625s_dapm_widgets[] = {
-	SND_SOC_DAPM_AIF_IN("DAC IN", "Playback", 0, SND_SOC_NOPM, 0, 0),
-	SND_SOC_DAPM_DAC_E("DAC", NULL, SND_SOC_NOPM, 0, 0,
-		acm8625s_dac_event, SND_SOC_DAPM_PRE_PMD),
-	SND_SOC_DAPM_OUTPUT("OUT")
-};
-
 static const struct snd_soc_component_driver soc_codec_dev_acm8625s = {
 	.controls		= acm8625s_snd_controls,
 	.num_controls		= ARRAY_SIZE(acm8625s_snd_controls),
-	.dapm_widgets		= acm8625s_dapm_widgets,
-	.num_dapm_widgets	= ARRAY_SIZE(acm8625s_dapm_widgets),
-	.dapm_routes		= acm8625s_audio_map,
-	.num_dapm_routes	= ARRAY_SIZE(acm8625s_audio_map),
 	.use_pmdown_time	= 1,
 	.endianness		= 1,
 };
@@ -413,13 +296,12 @@ static int acm8625s_mute(struct snd_soc_dai *dai, int mute, int direction)
 }
 
 static const struct snd_soc_dai_ops acm8625s_dai_ops = {
-	.trigger		= acm8625s_trigger,
 	.mute_stream		= acm8625s_mute,
 	.no_capture_mute	= 1,
 };
 
 static struct snd_soc_dai_driver acm8625s_dai = {
-	.name		= "acm8625s-amplifier",
+	.name		= "acm8625s-amp",
 	.playback	= {
 		.stream_name	= "Playback",
 		.channels_min	= 2,
@@ -441,19 +323,28 @@ static const struct regmap_config acm8625s_regmap = {
 	.cache_type	= REGCACHE_NONE,
 };
 
+static struct snd_soc_component_driver soc_component_dev_acm8625s = {
+	.idle_bias_on = 1,
+	.use_pmdown_time = 1,
+	.endianness = 1,
+};
+
 static int acm8625s_i2c_probe(struct i2c_client *i2c)
 {
 	struct device *dev = &i2c->dev;
 	struct regmap *regmap;
 	struct acm8625s_priv *acm8625s;
 
-	// wenhaoy: disable
-	// char filename[128];
-	// const char *config_name;
-	// const struct firmware *fw;
+	char filename[128];
+	const char *config_name;
+	const struct firmware *fw;
 	int ret;
-	dev_err(dev, "acm8625s: %s %d\n", __FILE__, __LINE__);
-printk("acm8625s: %s %d\n", __FILE__, __LINE__);
+
+	dev_info(dev, "acm8625s_i2c_probe(): Start I2C Probe\n");
+
+	devm_snd_soc_register_component(dev, &soc_component_dev_acm8625s,
+					&acm8625s_dai, 1);
+
 	regmap = devm_regmap_init_i2c(i2c, &acm8625s_regmap);
 	if (IS_ERR(regmap)) {
 		ret = PTR_ERR(regmap);
@@ -473,11 +364,8 @@ printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 	// 		PTR_ERR(acm8625s->pvdd));
 	// 	return PTR_ERR(acm8625s->pvdd);
 	// }
-printk("acm8625s: %s %d\n", __FILE__, __LINE__);
-
 	dev_set_drvdata(dev, acm8625s);
 	acm8625s->regmap = regmap;
-printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 
 	// wenhaoy: disable
 	// acm8625s->gpio_pdn_n = devm_gpiod_get(dev, "pdn", GPIOD_OUT_LOW);
@@ -495,32 +383,31 @@ printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 	 * The fixed portion of PPC3's output prior to the 5ms delay
 	 * should be omitted.
 	 */
-	// wenhaoy: disable firmware
-	// if (device_property_read_string(dev, "acme,dsp-config-name",
-	// 				&config_name))
-	// 	config_name = "default";
+	if (device_property_read_string(dev, "acme,dsp-config-name",
+					&config_name))
+		config_name = "default";
 
-	// snprintf(filename, sizeof(filename), "acm8625s_dsp_%s.bin",
-	// 	 config_name);
-	// ret = request_firmware(&fw, filename, dev);
-	// if (ret)
-	// 	return ret;
+	snprintf(filename, sizeof(filename), "acm8625s_dsp_%s.bin",
+		 config_name);
+	ret = request_firmware(&fw, filename, dev);
+	if (ret)
+		return ret;
 
-	// if ((fw->size < 2) || (fw->size & 1)) {
-	// 	dev_err(dev, "firmware is invalid\n");
-	// 	release_firmware(fw);
-	// 	return -EINVAL;
-	// }
+	if ((fw->size < 2) || (fw->size & 1)) {
+		dev_err(dev, "firmware is invalid\n");
+		release_firmware(fw);
+		return -EINVAL;
+	}
 
-	// acm8625s->dsp_cfg_len = fw->size;
-	// acm8625s->dsp_cfg_data = devm_kmalloc(dev, fw->size, GFP_KERNEL);
-	// if (!acm8625s->dsp_cfg_data) {
-	// 	release_firmware(fw);
-	// 	return -ENOMEM;
-	// }
-	// memcpy(acm8625s->dsp_cfg_data, fw->data, fw->size);
+	acm8625s->dsp_cfg_len = fw->size;
+	acm8625s->dsp_cfg_data = devm_kmalloc(dev, fw->size, GFP_KERNEL);
+	if (!acm8625s->dsp_cfg_data) {
+		release_firmware(fw);
+		return -ENOMEM;
+	}
+	memcpy(acm8625s->dsp_cfg_data, fw->data, fw->size);
 
-	// release_firmware(fw);
+	release_firmware(fw);
 
 	/* Do the first part of the power-on here, while we can expect
 	 * the I2S interface to be quiet. We must raise PDN# and then
@@ -532,9 +419,8 @@ printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 	 * incorrectly and the device comes up with an unpredictable I2C
 	 * address.
 	 */
-	acm8625s->vol[0] = ACM8625S_VOLUME_MIN;
-	acm8625s->vol[1] = ACM8625S_VOLUME_MIN;
-printk("acm8625s: %s %d\n", __FILE__, __LINE__);
+	acm8625s->vol[0] = ACM8625S_VOLUME_MAX;
+	acm8625s->vol[1] = ACM8625S_VOLUME_MAX;
 
 	// wenhaoy: disable
 	// ret = regulator_enable(acm8625s->pvdd);
@@ -547,9 +433,7 @@ printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 	// wenhaoy: disable
 	// gpiod_set_value(acm8625s->gpio_pdn_n, 1);
 	usleep_range(10000, 15000);
-printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 
-	INIT_WORK(&acm8625s->work, do_work);
 	mutex_init(&acm8625s->lock);
 
 	/* Don't register through devm. We need to be able to unregister
@@ -565,15 +449,29 @@ printk("acm8625s: %s %d\n", __FILE__, __LINE__);
 		return ret;
 	}
 
+	mutex_lock(&acm8625s->lock);
+	/* We mustn't issue any I2C transactions until the I2S
+	 * clock is stable. Furthermore, we must allow a 5ms
+	 * delay after the first set of register writes to
+	 * allow the DSP to boot before configuring it.
+	 */
+	usleep_range(5000, 10000);
+	send_cfg(regmap, dsp_cfg_preboot, ARRAY_SIZE(dsp_cfg_preboot));
+	usleep_range(5000, 15000);
+	send_cfg(regmap, acm8625s->dsp_cfg_data, acm8625s->dsp_cfg_len);
+
+	acm8625s->is_powered = true;
+	acm8625s_refresh(acm8625s);
+	mutex_unlock(&acm8625s->lock);
+
 	return 0;
 }
 
 static void acm8625s_i2c_remove(struct i2c_client *i2c)
 {
 	struct device *dev = &i2c->dev;
-	struct acm8625s_priv *acm8625s = dev_get_drvdata(dev);
+	// struct acm8625s_priv *acm8625s = dev_get_drvdata(dev);
 
-	cancel_work_sync(&acm8625s->work);
 	snd_soc_unregister_component(dev);
 	// wenhaoy: disable
 	// gpiod_set_value(acm8625s->gpio_pdn_n, 0);
